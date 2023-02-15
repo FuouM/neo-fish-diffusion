@@ -3,21 +3,22 @@ import json
 import os
 from functools import partial
 from typing import Union
+from tqdm import tqdm
 
-import gradio as gr
 import librosa
 import numpy as np
 import soundfile as sf
 import torch
-from fish_audio_preprocess.utils import loudness_norm, separate_audio
+
+from loudness_norm import loudness_norm
 from loguru import logger
 from mmengine import Config
 
-from fish_diffusion.feature_extractors import FEATURE_EXTRACTORS, PITCH_EXTRACTORS
-from fish_diffusion.utils.audio import get_mel_from_audio, slice_audio
-from fish_diffusion.utils.inference import load_checkpoint
-from fish_diffusion.utils.tensor import repeat_expand
+from feature_extractors import FEATURE_EXTRACTORS, PITCH_EXTRACTORS
+from audio_processing import get_mel_from_audio, slice_audio
+from utils import load_checkpoint
 
+from tensor import repeat_expand
 
 @torch.no_grad()
 def inference(
@@ -29,13 +30,10 @@ def inference(
     pitch_adjust=0,
     silence_threshold=60,
     max_slice_duration=30.0,
-    extract_vocals=True,
-    merge_non_vocals=True,
     vocals_loudness_gain=0.0,
     sampler_interval=None,
     sampler_progress=False,
     device="cuda",
-    gradio_progress=None,
 ):
     """Inference
 
@@ -68,40 +66,8 @@ def inference(
 
     audio, sr = librosa.load(input_path, sr=config.sampling_rate, mono=True)
 
-    # Extract vocals
-
-    if extract_vocals:
-        logger.info("Extracting vocals...")
-
-        if gradio_progress is not None:
-            gradio_progress(0, "Extracting vocals...")
-
-        model = separate_audio.init_model("htdemucs", device=device)
-        audio = librosa.resample(audio, orig_sr=sr, target_sr=model.samplerate)[None]
-
-        # To two channels
-        audio = np.concatenate([audio, audio], axis=0)
-        audio = torch.from_numpy(audio).to(device)
-        tracks = separate_audio.separate_audio(
-            model, audio, shifts=1, num_workers=0, progress=True
-        )
-        audio = separate_audio.merge_tracks(tracks, filter=["vocals"]).cpu().numpy()
-        non_vocals = (
-            separate_audio.merge_tracks(tracks, filter=["drums", "bass", "other"])
-            .cpu()
-            .numpy()
-        )
-
-        audio = librosa.resample(audio[0], orig_sr=model.samplerate, target_sr=sr)
-        non_vocals = librosa.resample(
-            non_vocals[0], orig_sr=model.samplerate, target_sr=sr
-        )
-
-        # Normalize loudness
-        non_vocals = loudness_norm.loudness_norm(non_vocals, sr)
-
     # Normalize loudness
-    audio = loudness_norm.loudness_norm(audio, sr)
+    audio = loudness_norm(audio, sr)
 
     # Slice into segments
     segments = list(
@@ -125,10 +91,7 @@ def inference(
     generated_audio = np.zeros_like(audio)
     audio_torch = torch.from_numpy(audio).to(device)[None]
 
-    for idx, (start, end) in enumerate(segments):
-        if gradio_progress is not None:
-            gradio_progress(idx / len(segments), "Generating audio...")
-
+    for idx, (start, end) in enumerate(tqdm(segments, desc='Generating audio...')):
         segment = audio_torch[:, start:end]
         logger.info(
             f"Processing segment {idx + 1}/{len(segments)}, duration: {segment.shape[-1] / sr:.2f}s"
@@ -163,16 +126,13 @@ def inference(
         max_wav_len = generated_audio.shape[-1] - start
         generated_audio[start : start + wav.shape[-1]] = wav[:max_wav_len]
 
+
     # Loudness normalization
-    generated_audio = loudness_norm.loudness_norm(generated_audio, sr)
+    generated_audio = loudness_norm(generated_audio, sr)
 
     # Loudness gain
     loudness_float = 10 ** (vocals_loudness_gain / 20)
     generated_audio = generated_audio * loudness_float
-
-    # Merge non-vocals
-    if extract_vocals and merge_non_vocals:
-        generated_audio = (generated_audio + non_vocals) / 2
 
     logger.info("Done")
 
@@ -197,18 +157,6 @@ def parse_args():
         type=str,
         required=True,
         help="Path to the checkpoint file",
-    )
-
-    parser.add_argument(
-        "--gradio",
-        action="store_true",
-        help="Run in gradio mode",
-    )
-
-    parser.add_argument(
-        "--gradio_share",
-        action="store_true",
-        help="Share gradio app",
     )
 
     parser.add_argument(
@@ -247,18 +195,6 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--extract_vocals",
-        action="store_true",
-        help="Extract vocals",
-    )
-
-    parser.add_argument(
-        "--merge_non_vocals",
-        action="store_true",
-        help="Merge non-vocals",
-    )
-
-    parser.add_argument(
         "--vocals_loudness_gain",
         type=float,
         default=0,
@@ -289,7 +225,6 @@ def parse_args():
 
     return parser.parse_args()
 
-
 def run_inference(
     config_path: str,
     model_path: str,
@@ -297,9 +232,7 @@ def run_inference(
     speaker: Union[int, str],
     pitch_adjust: int,
     sampler_interval: int,
-    extract_vocals: bool,
     device: str,
-    progress=gr.Progress(),
     speaker_mapping: dict = None,
 ):
     if speaker_mapping is not None and isinstance(speaker, str):
@@ -313,113 +246,28 @@ def run_inference(
         speaker_id=speaker,
         pitch_adjust=pitch_adjust,
         sampler_interval=round(sampler_interval),
-        extract_vocals=extract_vocals,
         merge_non_vocals=False,
         device=device,
-        gradio_progress=progress,
     )
-
     return (sr, audio)
-
-
-def launch_gradio(args):
-    with gr.Blocks(title="Fish Diffusion") as app:
-        gr.Markdown("# Fish Diffusion SVC Inference")
-
-        with gr.Row():
-            with gr.Column():
-                input_audio = gr.Audio(
-                    label="Input Audio",
-                    type="filepath",
-                    value=args.input,
-                )
-                output_audio = gr.Audio(label="Output Audio")
-
-            with gr.Column():
-                if args.speaker_mapping is not None:
-                    speaker_mapping = json.load(open(args.speaker_mapping))
-
-                    speaker = gr.Dropdown(
-                        label="Speaker Name (Used for Multi-Speaker Models)",
-                        choices=list(speaker_mapping.keys()),
-                        value=list(speaker_mapping.keys())[0],
-                    )
-                else:
-                    speaker_mapping = None
-                    speaker = gr.Number(
-                        label="Speaker ID (Used for Multi-Speaker Models)",
-                        value=args.speaker_id,
-                    )
-
-                pitch_adjust = gr.Number(
-                    label="Pitch Adjust (Semitones)", value=args.pitch_adjust
-                )
-                sampler_interval = gr.Slider(
-                    label="Sampler Interval (⬆️ Faster Generation, ⬇️ Better Quality)",
-                    value=args.sampler_interval or 10,
-                    minimum=1,
-                    maximum=100,
-                )
-                extract_vocals = gr.Checkbox(
-                    label="Extract Vocals (For low quality audio)",
-                    value=args.extract_vocals,
-                )
-                device = gr.Radio(
-                    label="Device", choices=["cuda", "cpu"], value=args.device or "cuda"
-                )
-
-                run_btn = gr.Button(label="Run")
-
-            run_btn.click(
-                partial(
-                    run_inference,
-                    args.config,
-                    args.checkpoint,
-                    speaker_mapping=speaker_mapping,
-                ),
-                [
-                    input_audio,
-                    speaker,
-                    pitch_adjust,
-                    sampler_interval,
-                    extract_vocals,
-                    device,
-                ],
-                output_audio,
-            )
-
-    app.queue(concurrency_count=2).launch(share=args.gradio_share)
-
 
 if __name__ == "__main__":
     args = parse_args()
-
-    assert args.gradio or (
-        args.input is not None and args.output is not None
-    ), "Either --gradio or --input and --output should be specified"
 
     if args.device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(args.device)
 
-    if args.gradio:
-        args.device = device
-        launch_gradio(args)
-
-    else:
-
-        inference(
-            Config.fromfile(args.config),
-            args.checkpoint,
-            args.input,
-            args.output,
-            speaker_id=args.speaker_id,
-            pitch_adjust=args.pitch_adjust,
-            extract_vocals=args.extract_vocals,
-            merge_non_vocals=args.merge_non_vocals,
-            vocals_loudness_gain=args.vocals_loudness_gain,
-            sampler_interval=args.sampler_interval,
-            sampler_progress=args.sampler_progress,
-            device=device,
-        )
+    inference(
+        Config.fromfile(args.config),
+        args.checkpoint,
+        args.input,
+        args.output,
+        speaker_id=args.speaker_id,
+        pitch_adjust=args.pitch_adjust,
+        vocals_loudness_gain=args.vocals_loudness_gain,
+        sampler_interval=args.sampler_interval,
+        sampler_progress=args.sampler_progress,
+        device=device
+    )

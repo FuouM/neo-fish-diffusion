@@ -6,12 +6,12 @@ import os
 import numpy as np
 import soundfile as sf
 import torch
-from fish_audio_preprocess.utils import loudness_norm
+from loudness_norm import loudness_norm
 from loguru import logger
 from mmengine import Config
 
-from fish_diffusion.feature_extractors import FEATURE_EXTRACTORS, PITCH_EXTRACTORS
-from fish_diffusion.utils.tensor import repeat_expand
+from feature_extractors import FEATURE_EXTRACTORS, PITCH_EXTRACTORS
+from tensor import repeat_expand
 from train import FishDiffusion
 
 
@@ -148,7 +148,7 @@ def inference(
         generated_audio[start : start + wav.shape[-1]] = wav[:max_wav_len]
 
     # Loudness normalization
-    generated_audio = loudness_norm.loudness_norm(generated_audio, config.sampling_rate)
+    generated_audio = loudness_norm(generated_audio, config.sampling_rate)
 
     sf.write(output_path, generated_audio, config.sampling_rate)
     logger.info("Done")

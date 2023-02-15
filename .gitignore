@@ -153,3 +153,6 @@ exp_*.sh
 .DS_Store
 .vscode
 exported
+
+model/
+remove/

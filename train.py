@@ -9,14 +9,12 @@ from mmengine import Config
 from mmengine.optim import OPTIMIZERS
 from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
 from torch.utils.data import DataLoader
-
-from fish_diffusion.archs.diffsinger import DiffSinger
-from fish_diffusion.datasets import DATASETS
-from fish_diffusion.datasets.repeat import RepeatDataset
-from fish_diffusion.utils.scheduler import LR_SCHEUDLERS
-from fish_diffusion.utils.viz import viz_synth_sample
-from fish_diffusion.vocoders import VOCODERS
-
+from scheduler import LR_SCHEUDLERS
+from ww.vocoders import VOCODERS
+from ww.datasets import DATASETS
+from diffsinger import DiffSinger
+from viz import viz_synth_sample
+from repeat import RepeatDataset
 
 class FishDiffusion(pl.LightningModule):
     def __init__(self, config):
@@ -26,7 +24,7 @@ class FishDiffusion(pl.LightningModule):
         self.model = DiffSinger(config.model)
         self.config = config
 
-        # 音频编码器, 将梅尔谱转换为音频
+        # Convert MEL to audio 
         self.vocoder = VOCODERS.build(config.model.vocoder)
         self.vocoder.freeze()
 
